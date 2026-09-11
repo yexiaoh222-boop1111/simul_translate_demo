@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>中文 → 英文 实时翻译 · 语义切分版</title>
+<style>
+  :root { --bg:#0f1115; --card:#171a21; --line:#262b36; --fg:#e6e9ef; --muted:#8a93a6;
+          --accent:#4f8cff; --green:#34d399; --orange:#f59e0b; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:14px/1.6 "Segoe UI","Microsoft YaHei",sans-serif; }
+  header { display:flex; align-items:center; gap:12px; flex-wrap:wrap;
+           padding:12px 20px; border-bottom:1px solid var(--line); }
+  h1 { font-size:17px; margin:0; }
+  .muted { color:var(--muted); font-size:12px; }
+  main { display:flex; gap:14px; padding:14px 20px; align-items:flex-start; }
+  aside { width:280px; flex:none; display:flex; flex-direction:column; gap:14px; }
+  #right { flex:1; min-width:0; display:flex; flex-direction:column; gap:14px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px; }
+  .pill { padding:2px 10px; border-radius:99px; font-size:12px; background:#333c4f; }
+  .pill.ready  { background:#134e33; color:var(--green); }
+  .pill.run    { background:#1e3a8a; color:#93c5fd; }
+  .pill.error  { background:#7f1d1d; color:#fca5a5; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:8px;
+           padding:9px 14px; font-size:14px; cursor:pointer; width:100%; }
+  button.stop { background:#b91c1c; }
+  button:disabled { opacity:.4; cursor:default; }
+  label { display:block; margin-top:10px; color:var(--muted); font-size:13px; }
+  input[type=range] { width:100%; }
+  .meter { height:14px; background:#0b0d11; border-radius:99px; overflow:hidden; }
+  #lvlbar { height:100%; width:0; border-radius:99px;
+            background:linear-gradient(90deg,#22c55e,#eab308,#ef4444); transition:width .08s; }
+  .badge { display:inline-block; margin-top:8px; padding:1px 10px; border-radius:99px;
+           font-size:12px; background:#262b36; color:var(--muted); margin-right:6px; }
+  .badge.on { background:#134e33; color:var(--green); }
+  .utt { border-left:3px solid var(--accent); }
+  .utt .zh { font-size:15px; margin:2px 0; }
+  .utt .en { font-size:17px; margin:2px 0 8px; color:#bcd3ff; }
+  .chip { display:inline-block; background:#0b0d11; border:1px solid var(--line);
+          border-radius:6px; padding:0 8px; margin:0 6px 6px 0; font-size:12px; color:var(--muted); }
+  .chip b { color:var(--fg); font-weight:600; }
+  audio { width:100%; height:32px; }
+  .pending { color:var(--muted); }
+  #log { margin:0; height:230px; overflow:auto; white-space:pre-wrap; word-break:break-all;
+         font:12px/1.7 Consolas,monospace; }
+  #log .record { color:var(--green); }
+  #log .jiazai { color:var(--orange); }
+  .spin { display:inline-block; animation:p 1s linear infinite; }
+  @keyframes p { to { transform:rotate(360deg); } }
+</style>
+</head>
+<body>
+<header>
+  <h1>🎙 中文 → 英文 实时翻译 <span style="color:var(--green)">· 语义切分</span></h1>
+  <span id="phase" class="pill">连接中…</span>
+  <span id="gpu" class="muted"></span>
+  <span id="session" class="muted"></span>
+</header>
+
+<main>
+  <aside>
+    <div class="card">
+      <button id="btnMic" disabled>开始采集</button>
+      <label>断句停顿 <b id="tailv">0.6</b> 秒
+        <input type="range" id="tail" min="0.2" max="1.5" step="0.1" value="0.6"></label>
+    </div>
+
+    <div class="card">
+      <div class="muted">麦克风监测 <span id="rmsv"></span></div>
+      <div class="meter"><div id="lvlbar"></div></div>
+      <span id="bSpeech" class="badge">安静</span>
+      <span id="bSpeaking" class="badge">🔊 播放中</span>
+      <label>噪声门限 <b id="thrv">0.003</b>（安静时看上方 RMS，调到比它略高；
+        默认已很低，出现误触发才往上调）
+        <input type="range" id="thr" min="0.001" max="0.03" step="0.001" value="0.003"></label>
+    </div>
+
+    <div class="card">
+      <div class="muted">耗时统计（累计）</div>
+      <div id="stats" class="muted">暂无</div>
+    </div>
+  </aside>
+
+  <div id="right">
+    <div id="utts"></div>
+    <div class="card"><div class="muted">服务日志（logs/service_log.txt）</div>
+      <pre id="log"></pre></div>
+  </div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let running = false;
+
+// ---------- WebSocket：收状态/电平/对话/日志事件 ----------
+function connect() {
+  const ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onmessage = e => handle(JSON.parse(e.data));
+  ws.onclose = () => setTimeout(connect, 2000);   // 断线重连
+}
+connect();
+
+function handle(ev) {
+  if (ev.type === "state")      return onState(ev);
+  if (ev.type === "level")      return onLevel(ev);
+  if (ev.type === "speaking")   return $("bSpeaking").classList.toggle("on", ev.on);
+  if (ev.type === "log")        return addLog(ev.line);
+  if (ev.type === "sess_open")  return addPending(ev.n);
+  if (ev.type === "sess_cancel")return $("p" + ev.n)?.remove();
+  if (ev.type === "seg")        return addSeg(ev);
+  if (ev.type === "utt_error")  return addLog(`!! utt_error: ${ev.msg}`);
+}
+
+// ---------- 状态 ----------
+function onState(ev) {
+  const p = $("phase");
+  if (ev.phase === "loading")      { p.textContent = "模型加载中…"; p.className = "pill"; }
+  else if (ev.phase === "ready")   { p.textContent = ev.running ? "运行中" : "就绪（未采集）";
+                                     p.className = "pill " + (ev.running ? "run" : "ready"); }
+  else                             { p.textContent = "加载失败: " + (ev.error || "");
+                                     p.className = "pill error"; }
+  $("gpu").textContent = ev.gpu === undefined ? "GPU 检测中…"
+      : ev.gpu ? `${ev.gpu_name} · 显存 ${ev.vram_alloc?.toFixed(1) || "?"}/${ev.vram_total?.toFixed(1)} GiB`
+      : (ev.mock ? "MOCK 模式" : "无 GPU");
+  if (ev.mock) $("gpu").textContent += "（假数据）";
+  $("session").textContent = ev.session ? "存档 demo_output/" + ev.session : "";
+  running = ev.running;
+  const b = $("btnMic");
+  b.disabled = ev.phase !== "ready";
+  b.textContent = running ? "停止采集" : "开始采集";
+  b.className = running ? "stop" : "";
+  // 首次同步配置
+  if (document.activeElement !== $("tail")) { $("tail").value = ev.config.tail_silence;
+                                              $("tailv").textContent = ev.config.tail_silence; }
+  if (document.activeElement !== $("thr")) { $("thr").value = ev.config.speech_rms;
+                                             $("thrv").textContent = ev.config.speech_rms; }
+  // 统计
+  const s = ev.stats || {};
+  const avg = s.asr ? (s.asr[0] / s.asr[1]).toFixed(2) + "s" : "-";
+  $("stats").innerHTML = Object.entries(s).map(([k, v]) =>
+      `${k}: <b>${v[0]}s</b> / ${v[1]}次 (均 ${(v[0] / v[1]).toFixed(2)}s)`).join("<br>")
+      + `<br>已完成 <b>${ev.n_utts}</b> 句`;
+}
+
+// ---------- 电平 ----------
+function onLevel(ev) {
+  $("lvlbar").style.width = Math.min(100, ev.rms * 400) + "%";
+  $("rmsv").textContent = "RMS " + ev.rms.toFixed(4);
+  const b = $("bSpeech");
+  b.textContent = ev.speech ? "说话中" : "安静";
+  b.classList.toggle("on", ev.speech);
+}
+
+// ---------- 对话卡片（语义分段：开会话出卡片，每个语义段一张卡片） ----------
+function addPending(n) {
+  const d = document.createElement("div");
+  d.className = "card utt"; d.id = "p" + n;
+  d.innerHTML = `<span class="spin">🎙</span> 句#${n} 正在聆听，语义切分同传中…`;
+  $("utts").prepend(d);
+}
+
+function addSeg(ev) {
+  $("p" + ev.n)?.remove();
+  const d = document.createElement("div");
+  d.className = "card utt";
+  const chip = (k, v, u = "s") => `<span class="chip">${k} <b>${v}${u}</b></span>`;
+  d.innerHTML = `
+    <div class="zh">句#${ev.n}·段${ev.k} 你说：${esc(ev.zh)}</div>
+    <div class="en">译文：${esc(ev.en)}</div>
+    <div>${chip("合成", ev.tts)}${chip("播放", ev.dur)}${chip("切段", ev.frags, "段")}</div>
+    <audio controls preload="none" src="/audio/${encodeURI(ev.wav)}"></audio>`;
+  $("utts").prepend(d);
+}
+
+const esc = s => s.replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+// ---------- 日志 ----------
+function addLog(line) {
+  const el = $("log");
+  const cls = line.includes("[record_log]") ? "record"
+            : line.includes("[model_jiazai]") ? "jiazai" : "";
+  el.insertAdjacentHTML("beforeend",
+      `<div${cls ? ` class="${cls}"` : ""}>${esc(line)}</div>`);
+  while (el.children.length > 800) el.firstChild.remove();   // 防止无限增长
+  el.scrollTop = el.scrollHeight;
+}
+
+// ---------- 控制 ----------
+$("btnMic").onclick = async () => {
+  await fetch(running ? "/api/mic/stop" : "/api/mic/start", { method: "POST" });
+};
+$("tail").onchange = () => { $("tailv").textContent = $("tail").value; saveSettings(); };
+$("thr").onchange = () => { $("thrv").textContent = $("thr").value; saveSettings(); };
+
+function saveSettings() {
+  fetch("/api/settings", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ tail_silence: parseFloat($("tail").value),
+                           speech_rms: parseFloat($("thr").value) }) });
+}
+</script>
+</body>
+</html>
